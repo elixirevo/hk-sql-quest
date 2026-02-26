@@ -1,3 +1,7 @@
+-- 문제 5: 성별 불균형 분석
+-- 2023년 4월 기준 각 읍/면/동에서 "남성이 여성보다 50% 이상 많은 연령대" 또는
+-- "여성이 남성보다 50% 이상 많은 연령대"가 가장 많은 지역 TOP 10을 찾으시오. (인구수)
+
 WITH GENDER_GENERATION_POP AS (
     SELECT
         ADMINIST_ZONE_NO
@@ -22,21 +26,12 @@ WITH GENDER_GENERATION_POP AS (
         , AGRDE_SE_CD
         , MALE_POP
         , FEMALE_POP
-        , CASE WHEN FEMALE_POP - MALE_POP > MALE_POP - FEMALE_POP THEN FEMALE_POP - MALE_POP ELSE MALE_POP - FEMALE_POP END AS TOTAL_DIFF
-#         , MALE_POP / FEMALE_POP AS MORE_MALE
-#         , FEMALE_POP / MALE_POP AS MORE_FEMALE
+        , ABS(FEMALE_POP - MALE_POP) AS TOTAL_DIFF
     FROM
         GENDER_GENERATION_POP
     WHERE
         MALE_POP / FEMALE_POP > 1.5
         OR FEMALE_POP / MALE_POP > 1.5
-    GROUP BY
-        ADMINIST_ZONE_NO
-        , ADMINIST_ZONE_NM
-        , AGRDE_SE_CD
-#     ORDER BY
-#         MALE_POP DESC
-#         , FEMALE_POP DESC;
 )
 SELECT *
 FROM CALC_POP
