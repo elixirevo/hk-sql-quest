@@ -1,0 +1,165 @@
+작성하신 SQL 쿼리들을 검토했습니다. CTE(`WITH` 구문)를 활용한 모듈화, 피벗(Pivot) 처리, 윈도우 함수(`RANK()`)의 사용 등 전체적으로 SQL 작성 능력이 매우 뛰어나십니다.
+
+실무적인 관점에서 **성능 최적화(단순화), 데이터 중복 집계 방지(Edge Case), 그리고 문제의 의도와 로직 간의 불일치**를 중심으로 피드백을 정리했습니다.
+
+***
+
+## 💡 종합 리뷰 및 공통 개선점
+
+1. **조건부 집계(Conditional Aggregation) 활용**: 조인과 다중 CTE를 줄이고 `SUM(CASE WHEN ...)`을 활용해 하나의 쿼리로 단순화할 수 있는 곳이 많습니다.
+2. **나눗셈(Division) 대신 곱셈(Multiplication) 활용**: 비율을 비교할 때 분모가 0이 되어 발생하는 `Divide by Zero` 에러를 방지하고 연산 속도를 높이기 위해, 수식을 넘겨서 곱셈으로 처리하는 것이 유리합니다. (예: \( \frac{A}{T} \ge 2 \times \frac{B}{T} \) ➡️ \( A \ge 2 \times B \))
+3. **중복 집계 주의**: 공공데이터 인구 테이블(`TB_POPLTN`)은 보통 전체('T'), 남성('M'), 여성('F') 코드가 혼재되어 있습니다. `POPLTN_SE_CD` 조건을 명확히 주지 않으면 인구가 2배로 부풀려질 수 있습니다.
+
+***
+
+## 🔍 문제별 상세 리뷰 및 쿼리 리팩토링
+
+### 문제 1: 연령대별 성비 편차가 큰 지역 찾기
+**[리뷰 포인트]**
+*   **절댓값 처리 누락**: 문제에서 남성과 여성의 "비율 차이"를 명시했습니다. 단순히 `(남성비율 - 여성비율) >= 0.1`로 하면 여성이 10% 이상 많은 경우는 누락됩니다. `ABS()` 함수를 추가하는 것이 정확합니다.
+*   **효율화**: `BASE`, `PIVOTED`, `RATIO`로 3단계 CTE를 거치지 않고 조건부 집계로 한 번에 줄일 수 있습니다.
+
+**[개선된 쿼리]**
+```sql
+WITH RATIO AS (
+    SELECT
+        ADMINIST_ZONE_NO,
+        ADMINIST_ZONE_NM,
+        AGRDE_SE_CD,
+        SUM(CASE WHEN POPLTN_SE_CD = 'M' THEN POPLTN_CNT ELSE 0 END) AS MALE_CNT,
+        SUM(CASE WHEN POPLTN_SE_CD = 'F' THEN POPLTN_CNT ELSE 0 END) AS FEMALE_CNT
+    FROM TB_POPLTN
+    WHERE STD_MT = '202304'
+        AND ADMINIST_ZONE_NO NOT LIKE '_____00000'
+        AND POPLTN_SE_CD IN ('M', 'F')
+    GROUP BY ADMINIST_ZONE_NO, ADMINIST_ZONE_NM, AGRDE_SE_CD
+    HAVING MALE_CNT + FEMALE_CNT > 0 -- 총인구 0명 제외 (Divide by zero 방지)
+)
+SELECT
+    ADMINIST_ZONE_NO,
+    ADMINIST_ZONE_NM,
+    COUNT(*) AS AGE_GROUP_DIFF_OVER_10P
+FROM RATIO
+-- 절댓값 ABS() 적용하여 남초/여초 모두 포함
+WHERE ABS((MALE_CNT / (MALE_CNT + FEMALE_CNT)) - (FEMALE_CNT / (MALE_CNT + FEMALE_CNT))) >= 0.1
+GROUP BY ADMINIST_ZONE_NO, ADMINIST_ZONE_NM
+ORDER BY AGE_GROUP_DIFF_OVER_10P DESC
+LIMIT 5;
+```
+
+### 문제 2: 청년층(20~40대) vs 노년층 비율 비교
+**[리뷰 포인트]**
+*   **조건 불일치**: 문제 제목은 `20~40대`인데, 쿼리 내 코드는 `010, 020, 030`(10~30대)으로 지정되어 있습니다. (통상적으로 `020, 030, 040`이 맞습니다)
+*   **수식 간소화**: 앞서 언급한 대로 양변에 `전체인구`로 나누는 과정을 생략하고 `청년층인구 >= 2 * 노년층인구`로 비교하면 훨씬 빠르고 간결합니다. `HAVING` 절을 쓰면 서브쿼리 없이 작성 가능합니다.
+
+**[개선된 쿼리]**
+```sql
+SELECT
+    ADMINIST_ZONE_NO,
+    ADMINIST_ZONE_NM,
+    SUM(CASE WHEN AGRDE_SE_CD IN ('020','030','040') THEN POPLTN_CNT ELSE 0 END) AS 청년층인구,
+    SUM(CASE WHEN AGRDE_SE_CD IN ('060','070','080','090','100') THEN POPLTN_CNT ELSE 0 END) AS 노년층인구,
+    SUM(POPLTN_CNT) AS 전체인구,
+    SUM(CASE WHEN AGRDE_SE_CD IN ('020','030','040') THEN POPLTN_CNT ELSE 0 END) / NULLIF(SUM(POPLTN_CNT), 0) AS 청년층비율,
+    SUM(CASE WHEN AGRDE_SE_CD IN ('060','070','080','090','100') THEN POPLTN_CNT ELSE 0 END) / NULLIF(SUM(POPLTN_CNT), 0) AS 노년층비율
+FROM TB_POPLTN
+WHERE STD_MT = '202304'
+    AND POPLTN_SE_CD = 'T'
+    AND ADMINIST_ZONE_NO LIKE '__00000000'
+GROUP BY ADMINIST_ZONE_NO, ADMINIST_ZONE_NM
+-- 수식 단순화: A/Total >= 2 * (B/Total) ➡️ A >= 2 * B
+HAVING SUM(CASE WHEN AGRDE_SE_CD IN ('020','030','040') THEN POPLTN_CNT ELSE 0 END)
+    >= 2 * SUM(CASE WHEN AGRDE_SE_CD IN ('060','070','080','090','100') THEN POPLTN_CNT ELSE 0 END)
+ORDER BY 청년층비율 DESC;
+```
+
+### 문제 3: 연령대별 집중도 분석
+**[리뷰 포인트]**
+*   **치명적 오류 (LIMIT)**: 문제 의도는 **"각 연령대별"**로 TOP 3를 찾는 것인데, 마지막에 `LIMIT 3`을 걸어버리면 전국 전체 연령대를 통틀어 단 3개의 row만 출력됩니다. 최종 SELECT에서는 `LIMIT 3`을 지워야 합니다.
+*   `CALC_RANK` CTE 내부에서 이미 `WHERE RNK <= 3`으로 연령대별 TOP 3를 필터링했으므로 최종 조회만 하면 됩니다.
+
+**[개선된 쿼리]**
+```sql
+-- KOREA_POP, LOCAL_POP, CALC_POP은 기존과 동일하므로 생략
+WITH ... 
+(기존 작성하신 KOREA_POP, LOCAL_POP, CALC_POP 동일)
+, CALC_RANK AS(
+    SELECT
+        AGRDE_SE_CD,
+        RNK,
+        ADMINIST_ZONE_NM,
+        RATE
+    FROM CALC_POP
+    WHERE RNK <= 3
+)
+SELECT
+    AGRDE_SE_CD,
+    RNK AS REAL_RANK,
+    ADMINIST_ZONE_NM,
+    RATE
+FROM CALC_RANK
+ORDER BY AGRDE_SE_CD ASC, REAL_RANK ASC;
+-- LIMIT 3 삭제 (각 연령대별로 3개씩 모두 출력하기 위함)
+```
+
+### 문제 4: 10대 vs 60대 비율 비교
+**[리뷰 포인트]**
+*   **데이터 뻥튀기 방지(중요)**: `REGION_POP`과 `AGE_POP` CTE의 `WHERE` 절에 `POPLTN_SE_CD = 'T'`(총인구) 조건이 누락되었습니다. 이를 누락하면 원본 테이블 구조에 따라 남성/여성/전체 인구가 모두 합산되어 `TOT_POP`이 실제보다 부풀려집니다.
+*   **단일 쿼리 통합**: 3개의 CTE와 JOIN을 쓸 필요 없이, 하나의 쿼리 안에서 `SUM(CASE WHEN ...)`으로 총인구, 10대, 60대 인구를 한 번에 뽑아낼 수 있습니다.
+
+**[개선된 쿼리]**
+```sql
+SELECT
+    ADMINIST_ZONE_NO,
+    ADMINIST_ZONE_NM,
+    SUM(CASE WHEN AGRDE_SE_CD = '010' THEN POPLTN_CNT ELSE 0 END) AS TEEN_POP,
+    SUM(CASE WHEN AGRDE_SE_CD = '060' THEN POPLTN_CNT ELSE 0 END) AS SIXTY_POP,
+    SUM(POPLTN_CNT) AS TOT_POP,
+    SUM(CASE WHEN AGRDE_SE_CD = '010' THEN POPLTN_CNT ELSE 0 END) / NULLIF(SUM(POPLTN_CNT), 0) AS TEEN_RATIO,
+    SUM(CASE WHEN AGRDE_SE_CD = '060' THEN POPLTN_CNT ELSE 0 END) / NULLIF(SUM(POPLTN_CNT), 0) AS SIXTY_RATIO
+FROM TB_POPLTN
+WHERE STD_MT = '202304'
+    AND ADMINIST_ZONE_NO NOT LIKE '_____00000'
+    AND POPLTN_SE_CD = 'T' -- 필수 추가 조건 (중복 합산 방지)
+GROUP BY ADMINIST_ZONE_NO, ADMINIST_ZONE_NM
+-- 수식 단순화: 10대 >= 3 * 60대
+HAVING SUM(CASE WHEN AGRDE_SE_CD = '010' THEN POPLTN_CNT ELSE 0 END) 
+    >= 3 * SUM(CASE WHEN AGRDE_SE_CD = '060' THEN POPLTN_CNT ELSE 0 END)
+ORDER BY TEEN_RATIO DESC;
+```
+
+### 문제 5: 성별 불균형 분석
+**[리뷰 포인트]**
+*   **나눗셈에 의한 에러 가능성**: `WHERE MALE_POP / FEMALE_POP >= 1.5`와 같은 연산은 `FEMALE_POP`이 0일 경우 에러가 발생합니다. 곱셈식(`MALE_POP >= 1.5 * FEMALE_POP`)으로 변환하는 것이 안전합니다.
+*   **문제 의도 해석**: 작성하신 코드는 불균형을 만족하는 읍/면/동의 **"총인구 차이(TOTAL_DIFF)가 큰 지역"** 10개를 뽑고 있습니다. 만약 문제1처럼 **"불균형을 나타내는 연령대가 (개수로서) 가장 많은 지역"**을 요구한 것이라면 `COUNT(*)`로 묶어서 풀어야 합니다. 문제의 `(인구수)`라는 힌트가 "차이 기반"을 의도했다면 기존 방식이 맞으나 에러 방지 차원의 쿼리 수정을 제안합니다.
+
+**[개선된 쿼리 (인구수 차이 기준 기준)]**
+```sql
+WITH GENDER_GENERATION_POP AS (
+    SELECT
+        ADMINIST_ZONE_NO,
+        ADMINIST_ZONE_NM,
+        AGRDE_SE_CD,
+        SUM(CASE WHEN POPLTN_SE_CD = 'M' THEN POPLTN_CNT ELSE 0 END) AS MALE_POP,
+        SUM(CASE WHEN POPLTN_SE_CD = 'F' THEN POPLTN_CNT ELSE 0 END) AS FEMALE_POP
+    FROM TB_POPLTN
+    WHERE STD_MT = '202304'
+        AND ADMINIST_ZONE_NO NOT LIKE '_____00000'
+        AND POPLTN_SE_CD IN ('M', 'F')
+    GROUP BY ADMINIST_ZONE_NO, ADMINIST_ZONE_NM, AGRDE_SE_CD
+)
+SELECT
+    ADMINIST_ZONE_NO,
+    ADMINIST_ZONE_NM,
+    AGRDE_SE_CD,
+    MALE_POP,
+    FEMALE_POP,
+    ABS(FEMALE_POP - MALE_POP) AS TOTAL_DIFF
+FROM GENDER_GENERATION_POP
+-- 나눗셈 대신 곱셈 활용하여 Divide By Zero 원천 차단
+WHERE MALE_POP >= 1.5 * FEMALE_POP 
+   OR FEMALE_POP >= 1.5 * MALE_POP
+ORDER BY TOTAL_DIFF DESC
+LIMIT 10;
+```
+*(※ 만약 "연령대 개수"가 많은 지역 TOP 10이 의도라면 `SELECT ADMINIST_ZONE_NO, COUNT(*) FROM ... GROUP BY ADMINIST_ZONE_NO ORDER BY COUNT(*) DESC LIMIT 10` 형태로 수정해야 합니다.)*
